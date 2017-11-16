@@ -28,14 +28,13 @@ import (
 )
 
 type workerWrapper struct {
-	readyChan  chan int
 	jobChan    chan interface{}
 	outputChan chan interface{}
 	poolOpen   uint32
 	worker     TunnyWorker
 }
 
-func (wrapper *workerWrapper) Loop() {
+func (wrapper *workerWrapper) Loop(workersChan chan<- *workerWrapper) {
 
 	// TODO: Configure?
 	tout := time.Duration(5)
@@ -48,7 +47,7 @@ func (wrapper *workerWrapper) Loop() {
 		time.Sleep(tout * time.Millisecond)
 	}
 
-	wrapper.readyChan <- 1
+	workersChan <- wrapper
 
 	for data := range wrapper.jobChan {
 		wrapper.outputChan <- wrapper.worker.TunnyJob(data)
@@ -58,26 +57,24 @@ func (wrapper *workerWrapper) Loop() {
 			}
 			time.Sleep(tout * time.Millisecond)
 		}
-		wrapper.readyChan <- 1
+		workersChan <- wrapper
 	}
 
-	close(wrapper.readyChan)
 	close(wrapper.outputChan)
 
 }
 
-func (wrapper *workerWrapper) Open() {
+func (wrapper *workerWrapper) Open(workersChan chan<- *workerWrapper) {
 	if extWorker, ok := wrapper.worker.(TunnyExtendedWorker); ok {
 		extWorker.TunnyInitialize()
 	}
 
-	wrapper.readyChan = make(chan int)
 	wrapper.jobChan = make(chan interface{})
 	wrapper.outputChan = make(chan interface{})
 
 	atomic.SwapUint32(&wrapper.poolOpen, uint32(1))
 
-	go wrapper.Loop()
+	go wrapper.Loop(workersChan)
 }
 
 // Follow this with Join(), otherwise terminate isn't called on the worker
@@ -91,9 +88,8 @@ func (wrapper *workerWrapper) Close() {
 func (wrapper *workerWrapper) Join() {
 	// Ensure that both the ready and output channels are closed
 	for {
-		_, readyOpen := <-wrapper.readyChan
 		_, outputOpen := <-wrapper.outputChan
-		if !readyOpen && !outputOpen {
+		if !outputOpen {
 			break
 		}
 	}

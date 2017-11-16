@@ -26,7 +26,6 @@ package tunny
 import (
 	"errors"
 	"expvar"
-	"reflect"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -106,7 +105,7 @@ guarantees all goroutines are stopped.
 */
 type WorkPool struct {
 	workers          []*workerWrapper
-	selects          []reflect.SelectCase
+	workersChan      chan *workerWrapper
 	statusMutex      sync.RWMutex
 	running          uint32
 	pendingAsyncJobs int32
@@ -133,15 +132,10 @@ func (pool *WorkPool) Open() (*WorkPool, error) {
 
 	if !pool.isRunning() {
 
-		pool.selects = make([]reflect.SelectCase, len(pool.workers))
+		pool.workersChan = make(chan *workerWrapper, len(pool.workers))
 
-		for i, workerWrapper := range pool.workers {
-			workerWrapper.Open()
-
-			pool.selects[i] = reflect.SelectCase{
-				Dir:  reflect.SelectRecv,
-				Chan: reflect.ValueOf(workerWrapper.readyChan),
-			}
+		for _, workerWrapper := range pool.workers {
+			workerWrapper.Open(pool.workersChan)
 		}
 
 		pool.setRunning(true)
@@ -239,45 +233,33 @@ func (pool *WorkPool) SendWorkTimed(milliTimeout time.Duration, jobData interfac
 		timeout := time.NewTimer(milliTimeout * time.Millisecond)
 		defer timeout.Stop()
 
-		// Create new selectcase[] and add time out case
-		selectCases := append(pool.selects[:], reflect.SelectCase{
-			Dir:  reflect.SelectRecv,
-			Chan: reflect.ValueOf(timeout.C),
-		})
-
 		// Wait for workers, or time out
-		if chosen, _, ok := reflect.Select(selectCases); ok {
+		select {
+		case worker := <-pool.workersChan:
+			worker.jobChan <- jobData
 
-			// Check if the selected index is a worker, otherwise we timed out
-			if chosen < (len(selectCases) - 1) {
-				pool.workers[chosen].jobChan <- jobData
+			// Wait for response, or time out
+			timeoutRemain := time.NewTimer((milliTimeout * time.Millisecond) - time.Since(before))
+			defer timeoutRemain.Stop()
 
-				timeoutRemain := time.NewTimer((milliTimeout * time.Millisecond) - time.Since(before))
-				defer timeoutRemain.Stop()
-
-				// Wait for response, or time out
-				select {
-				case data, open := <-pool.workers[chosen].outputChan:
-					if !open {
-						return nil, ErrWorkerClosed
-					}
-					return data, nil
-				case <-timeoutRemain.C:
-					/* If we time out here we also need to ensure that the output is still
-					 * collected and that the worker can move on. Therefore, we fork the
-					 * waiting process into a new goroutine.
-					 */
-					go func() {
-						pool.workers[chosen].Interrupt()
-						<-pool.workers[chosen].outputChan
-					}()
-					return nil, ErrJobTimedOut
+			select {
+			case data, open := <-worker.outputChan:
+				if !open {
+					return nil, ErrWorkerClosed
 				}
-			} else {
-				return nil, ErrJobTimedOut
+				return data, nil
+			case <-timeoutRemain.C:
+				/* If we time out here we also need to ensure that the output is still
+				 * collected and that the worker can move on. Therefore, we fork the
+				 * waiting process into a new goroutine.
+				 */
+				go func() {
+					worker.Interrupt()
+					<-worker.outputChan
+				}()
+				return nil, ErrWorkerClosed
 			}
-		} else {
-			// This means the chosen channel was closed
+		case <-timeout.C:
 			return nil, ErrWorkerClosed
 		}
 	} else {
@@ -313,16 +295,14 @@ func (pool *WorkPool) SendWork(jobData interface{}) (interface{}, error) {
 	defer pool.statusMutex.RUnlock()
 
 	if pool.isRunning() {
-		if chosen, _, ok := reflect.Select(pool.selects); ok && chosen >= 0 {
-			pool.workers[chosen].jobChan <- jobData
-			result, open := <-pool.workers[chosen].outputChan
+		worker := <-pool.workersChan
+		worker.jobChan <- jobData
 
-			if !open {
-				return nil, ErrWorkerClosed
-			}
-			return result, nil
+		result, open := <-worker.outputChan
+		if !open {
+			return nil, ErrWorkerClosed
 		}
-		return nil, ErrWorkerClosed
+		return result, nil
 	}
 	return nil, ErrPoolNotRunning
 }
